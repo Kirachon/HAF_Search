@@ -9,6 +9,10 @@ pub struct FileImportSession<'conn> {
     tx: Transaction<'conn>,
 }
 
+pub struct MatchImportSession<'conn> {
+    tx: Transaction<'conn>,
+}
+
 impl<'conn> FileImportSession<'conn> {
     pub fn upsert_file(&mut self, file_path: &str, file_name: &str) -> Result<()> {
         let scan_date = Utc::now().to_rfc3339();
@@ -17,6 +21,26 @@ impl<'conn> FileImportSession<'conn> {
              ON CONFLICT(file_path) DO UPDATE SET file_name=excluded.file_name, scan_date=excluded.scan_date",
         )?;
         stmt.execute(params![file_path, file_name, scan_date])?;
+        Ok(())
+    }
+
+    pub fn commit(self) -> Result<()> {
+        self.tx.commit()
+    }
+}
+
+impl<'conn> MatchImportSession<'conn> {
+    pub fn clear_all(&mut self) -> Result<()> {
+        self.tx.execute("DELETE FROM matches", [])?;
+        Ok(())
+    }
+
+    pub fn insert_match(&mut self, hh_id: &str, file_id: i64, similarity_score: f64) -> Result<()> {
+        let match_date = Utc::now().to_rfc3339();
+        self.tx.execute(
+            "INSERT INTO matches (hh_id, file_id, similarity_score, match_date) VALUES (?1, ?2, ?3, ?4)",
+            params![hh_id, file_id, similarity_score, match_date],
+        )?;
         Ok(())
     }
 
@@ -133,6 +157,16 @@ impl Database {
             [],
         )?;
 
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_matches_file_id ON matches(file_id)",
+            [],
+        )?;
+
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_matches_hh_similarity ON matches(hh_id, similarity_score DESC)",
+            [],
+        )?;
+
         Ok(())
     }
 
@@ -158,6 +192,11 @@ impl Database {
     pub fn start_file_import(&mut self) -> Result<FileImportSession<'_>> {
         let tx = self.conn.transaction()?;
         Ok(FileImportSession { tx })
+    }
+
+    pub fn start_match_import(&mut self) -> Result<MatchImportSession<'_>> {
+        let tx = self.conn.transaction()?;
+        Ok(MatchImportSession { tx })
     }
 
     pub fn get_file_id(&self, file_path: &str) -> Result<i64> {

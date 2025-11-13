@@ -5,6 +5,7 @@ use crate::reference_loader::{ReferenceLoadReport, ReferenceLoader};
 use crate::scanner::Scanner;
 use crate::searcher::Searcher;
 use eframe::egui;
+use log::error;
 use rfd::FileDialog;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -357,9 +358,29 @@ impl TiffLocatorApp {
                 }
             };
 
+            let cached_results = match db_guard.search_single_id(&search_id, threshold) {
+                Ok(results) => results,
+                Err(e) => {
+                    let _ = sender.send(BackgroundMessage::SearchError {
+                        error: format!("Failed to read cached matches: {}", e),
+                    });
+                    return;
+                }
+            };
+
+            if !cached_results.is_empty() {
+                drop(db_guard);
+                let _ = sender.send(BackgroundMessage::SearchComplete {
+                    results: cached_results,
+                    cache_error: None,
+                });
+                return;
+            }
+
             let results = match searcher.search_single_id(&search_id, &*db_guard, threshold) {
                 Ok(results) => results,
                 Err(e) => {
+                    drop(db_guard);
                     let _ = sender.send(BackgroundMessage::SearchError { error: e });
                     return;
                 }
@@ -416,7 +437,7 @@ impl TiffLocatorApp {
             });
 
             let result = {
-                let db_guard = match db_for_thread.lock() {
+                let mut db_guard = match db_for_thread.lock() {
                     Ok(guard) => guard,
                     Err(e) => {
                         let _ = sender.send(BackgroundMessage::MatchingError {
@@ -436,7 +457,7 @@ impl TiffLocatorApp {
                     }
                 };
 
-                matcher.match_and_store(&hh_ids, &*db_guard, threshold)
+                matcher.match_and_store(&hh_ids, &mut *db_guard, threshold)
             };
 
             match result {
@@ -895,8 +916,19 @@ impl eframe::App for TiffLocatorApp {
 
                                     let file_path = result.file_path.clone();
                                     if ui.button("📂 Open Location").clicked() {
-                                        if let Err(e) = opener::open_file_location(&file_path) {
-                                            eprintln!("Failed to open location: {}", e);
+                                        match opener::open_file_location(&file_path) {
+                                            Ok(_) => {
+                                                self.status_message = format!(
+                                                    "Opened file location for {}",
+                                                    result.file_name
+                                                );
+                                                self.error_message.clear();
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to open location: {}", e);
+                                                self.error_message =
+                                                    format!("Failed to open location: {}", e);
+                                            }
                                         }
                                     }
                                     ui.end_row();

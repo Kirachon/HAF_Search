@@ -1,8 +1,8 @@
 use crate::database::{Database, FileRecord};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
-use log::debug;
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone)]
@@ -12,6 +12,31 @@ pub struct MatchResult {
     pub file_name: String,
     pub file_path: String,
     pub similarity: f64,
+}
+
+#[derive(Clone)]
+struct FileMatchContext {
+    record: FileRecord,
+    candidates: Vec<String>,
+}
+
+impl FileMatchContext {
+    fn from_record(record: &FileRecord) -> Self {
+        let mut candidates = Vec::with_capacity(3);
+        candidates.push(record.file_name.to_lowercase());
+        if let Some(stem) = Matcher::strip_tiff_suffix(&record.file_name) {
+            candidates.push(stem.to_lowercase());
+        }
+        let extracted = Matcher::extract_id_from_filename(&record.file_name);
+        if !extracted.is_empty() {
+            candidates.push(extracted.to_lowercase());
+        }
+
+        FileMatchContext {
+            record: record.clone(),
+            candidates,
+        }
+    }
 }
 
 pub struct Matcher {
@@ -45,43 +70,6 @@ impl Matcher {
         name.replace(['_', '-', ' ', '.'], "")
     }
 
-    /// Calculate similarity between two strings using fuzzy matching
-    fn calculate_similarity(matcher: &SkimMatcherV2, hh_id: &str, filename: &str) -> f64 {
-        let trimmed = hh_id.trim();
-        if trimmed.is_empty() {
-            return 0.0;
-        }
-
-        let needle = trimmed.to_lowercase();
-        let perfect_score = Self::perfect_score(matcher, &needle);
-
-        let mut best = 0.0;
-        let mut candidates = Vec::with_capacity(2);
-        candidates.push(filename.to_lowercase());
-        let extracted_id = Self::extract_id_from_filename(filename);
-        if !extracted_id.is_empty() {
-            candidates.push(extracted_id.to_lowercase());
-        }
-
-        for candidate in candidates.into_iter().filter(|c| !c.is_empty()) {
-            let score_forward = matcher.fuzzy_match(&candidate, &needle).unwrap_or(0);
-            let score_reverse = matcher.fuzzy_match(&needle, &candidate).unwrap_or(0);
-            let raw_score = score_forward.max(score_reverse);
-            let normalized = Self::normalize_score(raw_score, &candidate, &needle, perfect_score);
-
-            debug!(
-                "Matcher score for '{}' vs '{}': raw={}, normalized={:.3}",
-                hh_id, candidate, raw_score, normalized
-            );
-
-            if normalized > best {
-                best = normalized;
-            }
-        }
-
-        best
-    }
-
     /// Match household IDs against TIFF files
     pub fn match_ids(
         &self,
@@ -90,41 +78,40 @@ impl Matcher {
         min_similarity: f64,
     ) -> Vec<MatchResult> {
         let total = hh_ids.len();
-        let processed = Arc::new(Mutex::new(0usize));
+        let processed = Arc::new(AtomicUsize::new(0));
         let progress_callback = self.progress_callback.clone();
+
+        let file_contexts: Vec<FileMatchContext> = files
+            .par_iter()
+            .map(FileMatchContext::from_record)
+            .collect();
+
+        if file_contexts.is_empty() {
+            return Vec::new();
+        }
 
         // Perform matching in parallel
         let results: Vec<MatchResult> = hh_ids
-            .par_iter()
-            .flat_map(|hh_id| {
+            .par_chunks(32)
+            .flat_map_iter(|chunk| {
                 let matcher = SkimMatcherV2::default();
-                let mut matches = Vec::new();
+                let mut chunk_results = Vec::new();
 
-                // Find best match for this hh_id
-                for file in files {
-                    let similarity = Self::calculate_similarity(&matcher, hh_id, &file.file_name);
-
-                    if similarity >= min_similarity {
-                        matches.push(MatchResult {
-                            hh_id: hh_id.clone(),
-                            file_id: file.id,
-                            file_name: file.file_name.clone(),
-                            file_path: file.file_path.clone(),
-                            similarity,
-                        });
-                    }
+                for hh_id in chunk {
+                    let matches_for_id =
+                        Self::match_single_id(&matcher, hh_id, &file_contexts, min_similarity);
+                    chunk_results.extend(matches_for_id);
                 }
 
-                // Update progress
                 if let Some(ref callback) = progress_callback {
-                    let mut count = processed.lock().unwrap();
-                    *count += 1;
+                    let completed =
+                        processed.fetch_add(chunk.len(), Ordering::Relaxed) + chunk.len();
                     if let Ok(mut cb) = callback.lock() {
-                        cb(*count, total);
+                        cb(completed.min(total), total);
                     }
                 }
 
-                matches
+                chunk_results
             })
             .collect();
 
@@ -135,7 +122,7 @@ impl Matcher {
     pub fn match_and_store(
         &self,
         hh_ids: &[String],
-        db: &Database,
+        db: &mut Database,
         min_similarity: f64,
     ) -> Result<usize, String> {
         // Get all files from database
@@ -147,23 +134,31 @@ impl Matcher {
             return Err("No files found in database. Please scan a directory first.".to_string());
         }
 
-        // Clear previous matches
-        db.clear_matches()
-            .map_err(|e| format!("Failed to clear previous matches: {}", e))?;
-
         // Perform matching
         let matches = self.match_ids(hh_ids, &files, min_similarity);
         let count = matches.len();
 
-        // Store matches in database
+        let mut session = db
+            .start_match_import()
+            .map_err(|e| format!("Failed to start match transaction: {}", e))?;
+
+        session
+            .clear_all()
+            .map_err(|e| format!("Failed to clear previous matches: {}", e))?;
+
         for match_result in matches {
-            db.insert_match(
-                &match_result.hh_id,
-                match_result.file_id,
-                match_result.similarity,
-            )
-            .map_err(|e| format!("Failed to store match: {}", e))?;
+            session
+                .insert_match(
+                    &match_result.hh_id,
+                    match_result.file_id,
+                    match_result.similarity,
+                )
+                .map_err(|e| format!("Failed to store match: {}", e))?;
         }
+
+        session
+            .commit()
+            .map_err(|e| format!("Failed to commit matches: {}", e))?;
 
         Ok(count)
     }
@@ -191,6 +186,58 @@ impl Matcher {
         let len_ratio =
             (candidate_len.min(query_len) as f64) / (candidate_len.max(query_len) as f64);
         (base * len_ratio).min(1.0)
+    }
+
+    fn match_single_id(
+        matcher: &SkimMatcherV2,
+        hh_id: &str,
+        files: &[FileMatchContext],
+        min_similarity: f64,
+    ) -> Vec<MatchResult> {
+        let mut results = Vec::new();
+        let trimmed = hh_id.trim();
+        if trimmed.is_empty() {
+            return results;
+        }
+
+        let needle = trimmed.to_lowercase();
+        let perfect_score = Self::perfect_score(matcher, &needle);
+
+        for context in files {
+            let mut best = 0.0;
+            for candidate in &context.candidates {
+                let score_forward = matcher.fuzzy_match(candidate, &needle).unwrap_or(0);
+                let score_reverse = matcher.fuzzy_match(&needle, candidate).unwrap_or(0);
+                let raw_score = score_forward.max(score_reverse);
+                let normalized =
+                    Self::normalize_score(raw_score, candidate, &needle, perfect_score);
+                if normalized > best {
+                    best = normalized;
+                }
+                if best >= min_similarity {
+                    break;
+                }
+            }
+
+            if best >= min_similarity {
+                results.push(MatchResult {
+                    hh_id: hh_id.to_string(),
+                    file_id: context.record.id,
+                    file_name: context.record.file_name.clone(),
+                    file_path: context.record.file_path.clone(),
+                    similarity: best,
+                });
+            }
+        }
+
+        results
+    }
+
+    fn strip_tiff_suffix(name: &str) -> Option<&str> {
+        name.strip_suffix(".tif")
+            .or_else(|| name.strip_suffix(".tiff"))
+            .or_else(|| name.strip_suffix(".TIF"))
+            .or_else(|| name.strip_suffix(".TIFF"))
     }
 }
 
