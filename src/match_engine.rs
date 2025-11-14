@@ -166,6 +166,8 @@ impl GpuMatchEngine {
                 );
                 let encoded = self.vectorizer.encode(name);
                 data.extend_from_slice(&encoded);
+                // Store the recomputed vector in cache to avoid recomputation
+                self.file_vectors.insert(*id, encoded);
             }
         }
         data
@@ -175,9 +177,13 @@ impl GpuMatchEngine {
         &mut self,
         files: &[(i64, String)],
     ) -> Result<(Arc<Buffer>, usize), String> {
+        // Create order-independent fingerprint by sorting files by ID
+        let mut sorted_ids: Vec<(i64, &String)> = files.iter().map(|(id, name)| (*id, name)).collect();
+        sorted_ids.sort_by_key(|(id, _)| *id);
+
         let mut hasher = DefaultHasher::new();
         files.len().hash(&mut hasher);
-        for (id, name) in files {
+        for (id, name) in sorted_ids {
             id.hash(&mut hasher);
             name.hash(&mut hasher);
         }
@@ -400,8 +406,10 @@ impl MatchEngine for GpuMatchEngine {
         let mut session = db
             .start_match_import()
             .map_err(|e| format!("Failed to start GPU match transaction: {}", e))?;
+
+        // Clear only matches for the hh_ids being processed (incremental update)
         session
-            .clear_all()
+            .clear_for_ids(hh_ids)
             .map_err(|e| format!("Failed to clear previous matches: {}", e))?;
 
         for result in &all_matches {

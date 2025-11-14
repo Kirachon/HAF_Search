@@ -382,7 +382,8 @@ impl DevicePoller {
             .spawn(move || {
                 while flag.load(Ordering::Relaxed) {
                     device.poll(wgpu::Maintain::Poll);
-                    thread::sleep(Duration::from_millis(1));
+                    // Reduced from 1ms to 10ms to lower CPU overhead
+                    thread::sleep(Duration::from_millis(10));
                 }
                 device.poll(wgpu::Maintain::Wait);
             })
