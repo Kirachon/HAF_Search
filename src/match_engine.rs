@@ -6,7 +6,7 @@ use log::info;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use wgpu::Buffer;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +36,49 @@ pub fn create_engine(kind: MatchEngineKind) -> Result<Box<dyn MatchEngine>, Stri
     }
 }
 
+fn make_logging_progress_callback(
+    activity: &'static str,
+    unit_label: &'static str,
+    total_hint: usize,
+) -> MatchProgressCallback {
+    let mut last_percent: Option<usize> = None;
+    Arc::new(Mutex::new(move |completed: usize, total: usize| {
+        let total_units = if total == 0 { total_hint.max(1) } else { total };
+        let display_total = if total == 0 { total_hint } else { total };
+        let done_units = if display_total == 0 {
+            completed
+        } else {
+            completed.min(display_total)
+        };
+
+        let percent = if total_units == 0 {
+            100
+        } else {
+            ((done_units.min(total_units) as f64 / total_units as f64) * 100.0)
+                .round()
+                .clamp(0.0, 100.0) as usize
+        };
+
+        let should_log = match last_percent {
+            Some(prev) => percent >= prev.saturating_add(5) || (percent == 100 && percent != prev),
+            None => true,
+        };
+
+        if should_log {
+            let display_total_value = if display_total == 0 {
+                total_hint.max(1)
+            } else {
+                display_total
+            };
+            info!(
+                "{} progress: {}% ({} / {} {})",
+                activity, percent, done_units, display_total_value, unit_label
+            );
+            last_percent = Some(percent);
+        }
+    }))
+}
+
 fn env_chunk(key: &str, default: usize) -> usize {
     std::env::var(key)
         .ok()
@@ -61,13 +104,46 @@ impl MatchEngine for CpuMatchEngine {
         min_similarity: f64,
         progress_callback: Option<MatchProgressCallback>,
     ) -> Result<usize, String> {
-        if let Some(callback) = progress_callback {
-            self.matcher.set_progress_handle(callback);
+        let total_ids = hh_ids.len();
+        let mut progress = progress_callback;
+
+        if total_ids > 0 && progress.is_none() {
+            progress = Some(make_logging_progress_callback(
+                "CPU matching",
+                "IDs",
+                total_ids,
+            ));
+        }
+
+        if let Some(ref callback) = progress {
+            if let Ok(mut cb) = callback.lock() {
+                cb(0, total_ids);
+            }
+            self.matcher.set_progress_handle(callback.clone());
         } else {
             self.matcher.clear_progress_callback();
         }
 
-        self.matcher.match_and_store(hh_ids, db, min_similarity)
+        if total_ids == 0 {
+            info!("CPU matching completed immediately: no household IDs provided");
+            return Ok(0);
+        }
+
+        info!(
+            "CPU matching started: processing {} household IDs",
+            total_ids
+        );
+
+        let result = self.matcher.match_and_store(hh_ids, db, min_similarity);
+
+        if let Ok(matches) = result {
+            info!(
+                "CPU matching finished: stored {} matches for {} household IDs",
+                matches, total_ids
+            );
+        }
+
+        result
     }
 }
 
@@ -255,8 +331,6 @@ struct ProgressTracker {
     completed_work: usize,
     total_tiles: usize,
     completed_tiles: usize,
-    last_logged_percent: usize,
-    last_logged_ids: usize,
 }
 
 impl ProgressTracker {
@@ -267,8 +341,6 @@ impl ProgressTracker {
             completed_work: 0,
             total_tiles: 0,
             completed_tiles: 0,
-            last_logged_percent: 0,
-            last_logged_ids: 0,
         }
     }
 
@@ -294,64 +366,17 @@ impl ProgressTracker {
         self.emit(progress);
     }
 
-    fn emit(&mut self, progress: Option<&MatchProgressCallback>) {
+    fn emit(&self, progress: Option<&MatchProgressCallback>) {
         if let Some(callback) = progress {
             if let Ok(mut cb) = callback.lock() {
-                let (ids_done, percent) = self.progress_metrics();
-                cb(ids_done, self.total_queries);
-                self.maybe_log(ids_done, percent);
-                return;
+                let ratio = if self.total_work == 0 {
+                    1.0
+                } else {
+                    (self.completed_work as f64 / self.total_work as f64).clamp(0.0, 1.0)
+                };
+                let mapped = (ratio * self.total_queries as f64).ceil() as usize;
+                cb(mapped.min(self.total_queries), self.total_queries);
             }
-        }
-
-        let (ids_done, percent) = self.progress_metrics();
-        self.maybe_log(ids_done, percent);
-    }
-
-    fn progress_metrics(&self) -> (usize, usize) {
-        if self.total_queries == 0 {
-            return (0, 100);
-        }
-
-        if self.total_work == 0 {
-            return (self.total_queries, 100);
-        }
-
-        let ratio = (self.completed_work as f64 / self.total_work as f64).clamp(0.0, 1.0);
-        let ids_done =
-            ((ratio * self.total_queries as f64).ceil() as usize).min(self.total_queries);
-        let percent = ((ids_done as f64 / self.total_queries as f64) * 100.0)
-            .round()
-            .clamp(0.0, 100.0) as usize;
-        (ids_done, percent)
-    }
-
-    fn maybe_log(&mut self, ids_done: usize, percent: usize) {
-        if self.total_queries == 0 {
-            return;
-        }
-
-        let first_emit = self.completed_tiles == 0
-            && self.last_logged_ids == 0
-            && self.last_logged_percent == 0
-            && ids_done == 0
-            && percent == 0;
-        let should_log = first_emit
-            || percent >= self.last_logged_percent.saturating_add(5)
-            || ids_done > self.last_logged_ids
-            || (percent == 100 && percent != self.last_logged_percent);
-
-        if should_log {
-            info!(
-                "GPU matching progress: {}% ({} / {} IDs, {} / {} tiles)",
-                percent,
-                ids_done,
-                self.total_queries,
-                self.completed_tiles.min(self.total_tiles),
-                self.total_tiles.max(1)
-            );
-            self.last_logged_percent = percent;
-            self.last_logged_ids = ids_done;
         }
     }
 }
@@ -383,23 +408,38 @@ impl MatchEngine for GpuMatchEngine {
             return Err("No files found in database. Please scan a directory first.".to_string());
         }
 
-        if hh_ids.is_empty() {
+        let total_queries = hh_ids.len();
+        let mut progress = progress_callback;
+
+        if total_queries == 0 {
+            if let Some(callback) = progress.as_ref() {
+                if let Ok(mut cb) = callback.lock() {
+                    cb(0, 0);
+                }
+            } else {
+                info!("GPU matching completed immediately: no household IDs provided");
+            }
             return Ok(0);
+        }
+
+        if progress.is_none() {
+            progress = Some(make_logging_progress_callback(
+                "GPU matching",
+                "IDs",
+                total_queries,
+            ));
+        }
+
+        if let Some(ref callback) = progress {
+            if let Ok(mut cb) = callback.lock() {
+                cb(0, total_queries);
+            }
         }
 
         let file_pairs: Vec<(i64, String)> = files
             .iter()
             .map(|record| (record.id, record.file_name.clone()))
             .collect();
-
-        info!(
-            "GPU match pass started: {} household IDs across {} files (query chunk: {}, file chunk: {}, in-flight tiles: {})",
-            hh_ids.len(),
-            file_pairs.len(),
-            self.chunk_size.max(1),
-            self.file_chunk_size.max(1),
-            self.inflight_limit
-        );
 
         db.cleanup_orphan_vectors()
             .map_err(|e| format!("Failed to clean vector cache: {}", e))?;
@@ -409,10 +449,14 @@ impl MatchEngine for GpuMatchEngine {
         let (file_buffer, _) = self.ensure_gpu_buffer(&file_pairs)?;
 
         let mut all_matches = Vec::new();
-        let progress = progress_callback;
         let mut tracker = ProgressTracker::new(hh_ids.len(), total_files);
-        tracker.emit(progress.as_ref());
         let mut pending: VecDeque<PendingTile<'_>> = VecDeque::new();
+
+        info!(
+            "GPU matching started: processing {} household IDs across {} files",
+            total_queries,
+            file_pairs.len()
+        );
 
         for chunk in hh_ids.chunks(self.chunk_size.max(1)) {
             if chunk.is_empty() {
@@ -485,12 +529,12 @@ impl MatchEngine for GpuMatchEngine {
             .commit()
             .map_err(|e| format!("Failed to commit GPU matches: {}", e))?;
 
+        let total_matches = all_matches.len();
         info!(
-            "GPU match pass complete: {} matches persisted for {} household IDs",
-            all_matches.len(),
-            hh_ids.len()
+            "GPU matching finished: stored {} matches for {} household IDs",
+            total_matches, total_queries
         );
 
-        Ok(all_matches.len())
+        Ok(total_matches)
     }
 }
