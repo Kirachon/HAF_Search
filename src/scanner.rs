@@ -1,10 +1,13 @@
 use crate::database::Database;
 use log::{info, warn};
+use rayon::iter::ParallelBridge;
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use walkdir::WalkDir;
+
+type ProgressCallback = Arc<Mutex<dyn FnMut(usize, usize) + Send>>;
 
 #[derive(Debug, Clone)]
 pub struct TiffFile {
@@ -13,7 +16,7 @@ pub struct TiffFile {
 }
 
 pub struct Scanner {
-    progress_callback: Option<Arc<Mutex<dyn FnMut(usize, usize) + Send>>>,
+    progress_callback: Option<ProgressCallback>,
 }
 
 #[derive(Debug, Clone)]
@@ -45,8 +48,24 @@ impl Scanner {
 
         info!("Starting filesystem walk at {}", path.display());
 
-        // First pass: collect all files under the directory
-        let entries: Vec<_> = WalkDir::new(path)
+        let total = WalkDir::new(path)
+            .follow_links(true)
+            .into_iter()
+            .filter_map(|entry| match entry {
+                Ok(e) => {
+                    if e.file_type().is_file() {
+                        Some(())
+                    } else {
+                        None
+                    }
+                }
+                Err(_) => None,
+            })
+            .count();
+        let processed = Arc::new(AtomicUsize::new(0));
+
+        // Second pass: filter TIFF files in parallel
+        let tiff_files: Vec<TiffFile> = WalkDir::new(path)
             .follow_links(true)
             .into_iter()
             .filter_map(|entry| match entry {
@@ -62,18 +81,10 @@ impl Scanner {
                     None
                 }
             })
-            .collect();
-
-        let total = entries.len();
-        let processed = Arc::new(AtomicUsize::new(0));
-
-        // Second pass: filter TIFF files in parallel
-        let tiff_files: Vec<TiffFile> = entries
-            .par_iter()
+            .par_bridge()
             .filter_map(|entry| {
                 let path = entry.as_path();
 
-                // Check if file has .tif or .tiff extension
                 if let Some(ext) = path.extension() {
                     let ext_str = ext.to_string_lossy().to_lowercase();
                     if ext_str == "tif" || ext_str == "tiff" {
@@ -140,7 +151,7 @@ impl Scanner {
 
 impl Scanner {
     fn report_progress(
-        callback: &Option<Arc<Mutex<dyn FnMut(usize, usize) + Send>>>,
+        callback: &Option<ProgressCallback>,
         processed: &Arc<AtomicUsize>,
         total: usize,
     ) {
@@ -154,7 +165,7 @@ impl Scanner {
             }
 
             let step = (total / 100).max(1);
-            if current % step == 0 || current == total {
+            if current.is_multiple_of(step) || current == total {
                 if let Ok(mut cb) = cb_handle.lock() {
                     cb(current.min(total), total);
                 }

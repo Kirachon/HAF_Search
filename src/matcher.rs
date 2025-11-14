@@ -5,12 +5,12 @@ use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+pub type ProgressCallback = Arc<Mutex<dyn FnMut(usize, usize) + Send>>;
+
 #[derive(Debug, Clone)]
 pub struct MatchResult {
     pub hh_id: String,
     pub file_id: i64,
-    pub file_name: String,
-    pub file_path: String,
     pub similarity: f64,
 }
 
@@ -40,7 +40,7 @@ impl FileMatchContext {
 }
 
 pub struct Matcher {
-    progress_callback: Option<Arc<Mutex<dyn FnMut(usize, usize) + Send>>>,
+    progress_callback: Option<ProgressCallback>,
 }
 
 impl Matcher {
@@ -50,11 +50,12 @@ impl Matcher {
         }
     }
 
-    pub fn set_progress_callback<F>(&mut self, callback: F)
-    where
-        F: FnMut(usize, usize) + Send + 'static,
-    {
-        self.progress_callback = Some(Arc::new(Mutex::new(callback)));
+    pub fn set_progress_handle(&mut self, handle: ProgressCallback) {
+        self.progress_callback = Some(handle);
+    }
+
+    pub fn clear_progress_callback(&mut self) {
+        self.progress_callback = None;
     }
 
     /// Extract potential ID from filename by removing common prefixes/suffixes and extensions
@@ -223,8 +224,6 @@ impl Matcher {
                 results.push(MatchResult {
                     hh_id: hh_id.to_string(),
                     file_id: context.record.id,
-                    file_name: context.record.file_name.clone(),
-                    file_path: context.record.file_path.clone(),
                     similarity: best,
                 });
             }

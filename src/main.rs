@@ -1,10 +1,13 @@
 mod database;
+mod gpu;
 mod gui;
+mod match_engine;
 mod matcher;
 mod opener;
 mod reference_loader;
 mod scanner;
 mod searcher;
+mod vectorizer;
 
 use eframe::NativeOptions;
 use gui::TiffLocatorApp;

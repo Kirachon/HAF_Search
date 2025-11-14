@@ -118,24 +118,4 @@ impl ReferenceLoader {
             errors,
         })
     }
-
-    pub fn load_from_csv(
-        &self,
-        csv_path: &str,
-        db: &mut Database,
-    ) -> Result<ReferenceLoadReport, String> {
-        self.load_from_csv_with_progress(csv_path, db, Option::<fn(usize, u64, u64)>::None)
-    }
-
-    /// Get count of reference IDs in database
-    pub fn get_count(&self, db: &Database) -> Result<usize, String> {
-        db.get_reference_id_count()
-            .map_err(|e| format!("Failed to get reference ID count: {}", e))
-    }
-
-    /// Clear all reference IDs from database
-    pub fn clear_all(&self, db: &Database) -> Result<(), String> {
-        db.clear_reference_ids()
-            .map_err(|e| format!("Failed to clear reference IDs: {}", e))
-    }
 }

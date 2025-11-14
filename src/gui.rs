@@ -1,5 +1,5 @@
 use crate::database::{Database, SearchResult};
-use crate::matcher::Matcher;
+use crate::match_engine::{self, MatchEngineKind, MatchProgressCallback};
 use crate::opener;
 use crate::reference_loader::{ReferenceLoadReport, ReferenceLoader};
 use crate::scanner::Scanner;
@@ -51,9 +51,13 @@ enum BackgroundMessage {
     },
     MatchingComplete {
         match_count: usize,
+        engine: MatchEngineKind,
     },
     MatchingError {
         error: String,
+    },
+    MatchingEngineNotice {
+        message: String,
     },
     SearchComplete {
         results: Vec<SearchResult>,
@@ -68,9 +72,12 @@ pub struct TiffLocatorApp {
     // Paths
     folder_path: String,
     csv_path: String,
+    cache_path: String,
 
     // Settings
     similarity_threshold: f64,
+    use_gpu_matcher: bool,
+    gpu_available: bool,
 
     // State
     state: AppState,
@@ -105,9 +112,10 @@ pub struct TiffLocatorApp {
 impl Default for TiffLocatorApp {
     fn default() -> Self {
         let (bg_sender, bg_receiver) = mpsc::channel();
+        let cache_path = "cache.db".to_string();
 
         let (db, reference_id_count, file_count, status_message, error_message) =
-            match Database::new("cache.db") {
+            match Database::new(&cache_path) {
                 Ok(db) => {
                     let reference_id_count = db.get_reference_id_count().unwrap_or(0);
                     let file_count = db.get_all_files().map(|files| files.len()).unwrap_or(0);
@@ -131,6 +139,7 @@ impl Default for TiffLocatorApp {
         Self {
             folder_path: String::new(),
             csv_path: String::new(),
+            cache_path,
             similarity_threshold: 0.7,
             state: AppState::Idle,
             progress: 0.0,
@@ -147,6 +156,8 @@ impl Default for TiffLocatorApp {
             last_reference_report: None,
             bg_receiver,
             bg_sender,
+            use_gpu_matcher: false,
+            gpu_available: true,
         }
     }
 }
@@ -190,13 +201,10 @@ impl TiffLocatorApp {
             return;
         }
 
-        let db = match self.db_handle() {
-            Ok(db) => db,
-            Err(err) => {
-                self.error_message = err;
-                return;
-            }
-        };
+        if self.db.is_none() {
+            self.error_message = "Database is unavailable. Check cache.db permissions.".to_string();
+            return;
+        }
 
         self.state = AppState::LoadingReferenceIds;
         self.progress = 0.0;
@@ -206,46 +214,39 @@ impl TiffLocatorApp {
         self.last_reference_report = None;
 
         let csv_path = self.csv_path.clone();
+        let cache_path = self.cache_path.clone();
         let sender = self.bg_sender.clone();
 
         thread::spawn(move || {
             let loader = ReferenceLoader::new();
-            let load_result = {
-                match db.lock() {
-                    Ok(mut guard) => {
-                        let progress_sender = sender.clone();
-                        let progress_callback =
-                            move |processed_rows: usize, bytes_read: u64, total_bytes: u64| {
-                                let _ =
-                                    progress_sender.send(BackgroundMessage::ReferenceIdsProgress {
-                                        processed_rows,
-                                        bytes_read,
-                                        total_bytes,
-                                    });
-                            };
-                        loader.load_from_csv_with_progress(
-                            &csv_path,
-                            &mut *guard,
-                            Some(progress_callback),
-                        )
-                    }
-                    Err(e) => {
-                        let _ = sender.send(BackgroundMessage::ReferenceIdsError {
-                            error: format!("Database access error while loading IDs: {}", e),
-                        });
-                        return;
-                    }
+            let mut db = match Database::new(&cache_path) {
+                Ok(db) => db,
+                Err(e) => {
+                    let _ = sender.send(BackgroundMessage::ReferenceIdsError {
+                        error: format!("Database access error while loading IDs: {}", e),
+                    });
+                    return;
                 }
             };
 
+            let progress_sender = sender.clone();
+            let progress_callback =
+                move |processed_rows: usize, bytes_read: u64, total_bytes: u64| {
+                    let _ = progress_sender.send(BackgroundMessage::ReferenceIdsProgress {
+                        processed_rows,
+                        bytes_read,
+                        total_bytes,
+                    });
+                };
+
+            let load_result =
+                loader.load_from_csv_with_progress(&csv_path, &mut db, Some(progress_callback));
+
             match load_result {
                 Ok(report) => {
-                    let total = match db.lock() {
-                        Ok(guard) => guard
-                            .get_reference_id_count()
-                            .map_err(|e| format!("Failed to refresh reference ID count: {}", e)),
-                        Err(e) => Err(format!("Database access error after load: {}", e)),
-                    };
+                    let total = db
+                        .get_reference_id_count()
+                        .map_err(|e| format!("Failed to refresh reference ID count: {}", e));
 
                     match total {
                         Ok(total) => {
@@ -270,13 +271,10 @@ impl TiffLocatorApp {
             return;
         }
 
-        let db = match self.db_handle() {
-            Ok(db) => db,
-            Err(err) => {
-                self.error_message = err;
-                return;
-            }
-        };
+        if self.db.is_none() {
+            self.error_message = "Database is unavailable. Check cache.db permissions.".to_string();
+            return;
+        }
 
         self.state = AppState::Scanning;
         self.progress = 0.0;
@@ -285,6 +283,7 @@ impl TiffLocatorApp {
         self.status_message.clear();
 
         let folder_path = self.folder_path.clone();
+        let cache_path = self.cache_path.clone();
         let sender = self.bg_sender.clone();
 
         thread::spawn(move || {
@@ -294,15 +293,22 @@ impl TiffLocatorApp {
                 let _ = progress_sender.send(BackgroundMessage::ScanProgress { processed, total });
             });
 
-            let result = match db.lock() {
-                Ok(mut guard) => match scanner.scan_and_store(&folder_path, &mut *guard) {
-                    Ok(report) => match guard.get_file_count() {
-                        Ok(total_files) => Ok((report, total_files)),
-                        Err(e) => Err(format!("Failed to refresh cached file count: {}", e)),
-                    },
-                    Err(e) => Err(e),
+            let mut db = match Database::new(&cache_path) {
+                Ok(db) => db,
+                Err(e) => {
+                    let _ = sender.send(BackgroundMessage::ScanError {
+                        error: format!("Database access error while scanning: {}", e),
+                    });
+                    return;
+                }
+            };
+
+            let result = match scanner.scan_and_store(&folder_path, &mut db) {
+                Ok(report) => match db.get_file_count() {
+                    Ok(total_files) => Ok((report, total_files)),
+                    Err(e) => Err(format!("Failed to refresh cached file count: {}", e)),
                 },
-                Err(e) => Err(format!("Database access error while scanning: {}", e)),
+                Err(e) => Err(e),
             };
 
             match result {
@@ -327,13 +333,10 @@ impl TiffLocatorApp {
             return;
         }
 
-        let db = match self.db_handle() {
-            Ok(db) => db,
-            Err(err) => {
-                self.error_message = err;
-                return;
-            }
-        };
+        if self.db.is_none() {
+            self.error_message = "Database is unavailable. Check cache.db permissions.".to_string();
+            return;
+        }
 
         self.state = AppState::Searching;
         self.progress = 0.0;
@@ -345,11 +348,12 @@ impl TiffLocatorApp {
         let search_id = search_id.to_string();
         let threshold = self.similarity_threshold;
         let sender = self.bg_sender.clone();
+        let cache_path = self.cache_path.clone();
 
         thread::spawn(move || {
             let searcher = Searcher::new();
-            let db_guard = match db.lock() {
-                Ok(guard) => guard,
+            let db = match Database::new(&cache_path) {
+                Ok(db) => db,
                 Err(e) => {
                     let _ = sender.send(BackgroundMessage::SearchError {
                         error: format!("Database access error while searching: {}", e),
@@ -358,7 +362,7 @@ impl TiffLocatorApp {
                 }
             };
 
-            let cached_results = match db_guard.search_single_id(&search_id, threshold) {
+            let cached_results = match db.search_single_id(&search_id, threshold) {
                 Ok(results) => results,
                 Err(e) => {
                     let _ = sender.send(BackgroundMessage::SearchError {
@@ -369,7 +373,6 @@ impl TiffLocatorApp {
             };
 
             if !cached_results.is_empty() {
-                drop(db_guard);
                 let _ = sender.send(BackgroundMessage::SearchComplete {
                     results: cached_results,
                     cache_error: None,
@@ -377,20 +380,15 @@ impl TiffLocatorApp {
                 return;
             }
 
-            let results = match searcher.search_single_id(&search_id, &*db_guard, threshold) {
+            let results = match searcher.search_single_id(&search_id, &db, threshold) {
                 Ok(results) => results,
                 Err(e) => {
-                    drop(db_guard);
                     let _ = sender.send(BackgroundMessage::SearchError { error: e });
                     return;
                 }
             };
 
-            let cache_error = searcher
-                .store_results(&search_id, &results, &*db_guard)
-                .err();
-
-            drop(db_guard);
+            let cache_error = searcher.store_results(&search_id, &results, &db).err();
 
             let _ = sender.send(BackgroundMessage::SearchComplete {
                 results,
@@ -410,13 +408,10 @@ impl TiffLocatorApp {
             return;
         }
 
-        let db = match self.db_handle() {
-            Ok(db) => db,
-            Err(err) => {
-                self.error_message = err;
-                return;
-            }
-        };
+        if self.db.is_none() {
+            self.error_message = "Database is unavailable. Check cache.db permissions.".to_string();
+            return;
+        }
 
         self.state = AppState::Matching;
         self.progress = 0.0;
@@ -425,44 +420,82 @@ impl TiffLocatorApp {
         self.status_message.clear();
 
         let sender = self.bg_sender.clone();
-        let db_for_thread = Arc::clone(&db);
+        let cache_path = self.cache_path.clone();
         let threshold = self.similarity_threshold;
+        let prefer_gpu = self.use_gpu_matcher && self.gpu_available;
 
         thread::spawn(move || {
-            let mut matcher = Matcher::new();
-            let progress_sender = sender.clone();
-            matcher.set_progress_callback(move |processed, total| {
-                let _ =
-                    progress_sender.send(BackgroundMessage::MatchingProgress { processed, total });
-            });
-
-            let result = {
-                let mut db_guard = match db_for_thread.lock() {
-                    Ok(guard) => guard,
-                    Err(e) => {
-                        let _ = sender.send(BackgroundMessage::MatchingError {
-                            error: format!("Database access error while matching: {}", e),
-                        });
-                        return;
-                    }
-                };
-
-                let hh_ids = match db_guard.get_all_reference_ids() {
-                    Ok(ids) => ids.into_iter().map(|id| id.hh_id).collect::<Vec<_>>(),
-                    Err(e) => {
-                        let _ = sender.send(BackgroundMessage::MatchingError {
-                            error: format!("Failed to read reference IDs: {}", e),
-                        });
-                        return;
-                    }
-                };
-
-                matcher.match_and_store(&hh_ids, &mut *db_guard, threshold)
+            let mut db = match Database::new(&cache_path) {
+                Ok(db) => db,
+                Err(e) => {
+                    let _ = sender.send(BackgroundMessage::MatchingError {
+                        error: format!("Database access error while matching: {}", e),
+                    });
+                    return;
+                }
             };
 
-            match result {
+            let hh_ids = match db.get_all_reference_ids() {
+                Ok(ids) => ids,
+                Err(e) => {
+                    let _ = sender.send(BackgroundMessage::MatchingError {
+                        error: format!("Failed to read reference IDs: {}", e),
+                    });
+                    return;
+                }
+            };
+
+            let desired_engine = if prefer_gpu {
+                MatchEngineKind::Gpu
+            } else {
+                MatchEngineKind::Cpu
+            };
+
+            let mut fallback_notice = None;
+            let mut engine = match match_engine::create_engine(desired_engine) {
+                Ok(engine) => engine,
+                Err(err) => {
+                    if desired_engine == MatchEngineKind::Gpu {
+                        fallback_notice = Some(format!(
+                            "GPU matcher unavailable ({}). Falling back to CPU matcher.",
+                            err
+                        ));
+                        match match_engine::create_engine(MatchEngineKind::Cpu) {
+                            Ok(engine) => engine,
+                            Err(cpu_err) => {
+                                let _ = sender.send(BackgroundMessage::MatchingError {
+                                    error: format!(
+                                        "Failed to initialize CPU matcher after GPU fallback: {}",
+                                        cpu_err
+                                    ),
+                                });
+                                return;
+                            }
+                        }
+                    } else {
+                        let _ = sender.send(BackgroundMessage::MatchingError { error: err });
+                        return;
+                    }
+                }
+            };
+
+            if let Some(message) = fallback_notice {
+                let _ = sender.send(BackgroundMessage::MatchingEngineNotice { message });
+            }
+
+            let progress_sender = sender.clone();
+            let progress_callback: MatchProgressCallback =
+                Arc::new(Mutex::new(move |processed, total| {
+                    let _ = progress_sender
+                        .send(BackgroundMessage::MatchingProgress { processed, total });
+                }));
+
+            match engine.match_and_store(&hh_ids, &mut db, threshold, Some(progress_callback)) {
                 Ok(count) => {
-                    let _ = sender.send(BackgroundMessage::MatchingComplete { match_count: count });
+                    let _ = sender.send(BackgroundMessage::MatchingComplete {
+                        match_count: count,
+                        engine: engine.kind(),
+                    });
                 }
                 Err(e) => {
                     let _ = sender.send(BackgroundMessage::MatchingError { error: e });
@@ -500,13 +533,13 @@ impl TiffLocatorApp {
 
         // Write headers
         writer
-            .write_record(&["file_name", "file_path", "similarity"])
+            .write_record(["file_name", "file_path", "similarity"])
             .map_err(|e| format!("Failed to write headers: {}", e))?;
 
         // Write data
         for result in &self.search_results {
             writer
-                .write_record(&[
+                .write_record([
                     &result.file_name,
                     &result.file_path,
                     &format!("{:.2}%", result.similarity_score * 100.0),
@@ -639,14 +672,22 @@ impl TiffLocatorApp {
                     }
                     self.progress_text = format!("Matching IDs... ({}/{})", processed, total);
                 }
-                BackgroundMessage::MatchingComplete { match_count } => {
+                BackgroundMessage::MatchingComplete {
+                    match_count,
+                    engine,
+                } => {
                     self.state = AppState::Idle;
                     self.progress = 1.0;
                     self.status_message = format!(
-                        "Matching complete: {} candidate matches stored",
-                        match_count
+                        "Matching complete using {:?}: {} candidate matches stored",
+                        engine, match_count
                     );
                     self.error_message.clear();
+                }
+                BackgroundMessage::MatchingEngineNotice { message } => {
+                    self.status_message = message;
+                    self.gpu_available = false;
+                    self.use_gpu_matcher = false;
                 }
                 BackgroundMessage::MatchingError { error } => {
                     self.state = AppState::Idle;
@@ -765,6 +806,22 @@ impl eframe::App for TiffLocatorApp {
                 ui.label(format!("{:.0}%", self.similarity_threshold * 100.0));
             });
 
+            ui.horizontal(|ui| {
+                let checkbox = egui::Checkbox::new(
+                    &mut self.use_gpu_matcher,
+                    "Use GPU matcher (experimental)",
+                );
+                let response = ui.add_enabled(self.gpu_available, checkbox);
+                if !self.gpu_available {
+                    ui.label(
+                        egui::RichText::new("GPU support unavailable for this build").italics(),
+                    );
+                } else if response.changed() && self.use_gpu_matcher {
+                    self.status_message =
+                        "GPU matcher enabled. Results will match the CPU baseline.".to_string();
+                }
+            });
+
             ui.add_space(10.0);
 
             // Action buttons
@@ -860,8 +917,7 @@ impl eframe::App for TiffLocatorApp {
                 let total_results = self.search_results.len();
                 let start_idx = self.results_page * self.results_per_page;
                 let end_idx = (start_idx + self.results_per_page).min(total_results);
-                let total_pages =
-                    (total_results + self.results_per_page - 1) / self.results_per_page;
+                let total_pages = total_results.div_ceil(self.results_per_page);
 
                 ui.heading(format!("Search Results ({} matches)", total_results));
 

@@ -1,5 +1,6 @@
+use bytemuck::cast_slice;
 use chrono::Utc;
-use rusqlite::{params, Connection, Result, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Result, Transaction};
 
 pub struct Database {
     conn: Connection,
@@ -54,25 +55,6 @@ pub struct FileRecord {
     pub id: i64,
     pub file_path: String,
     pub file_name: String,
-    pub scan_date: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct ReferenceId {
-    pub id: i64,
-    pub hh_id: String,
-    pub import_date: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct MatchRecord {
-    pub id: i64,
-    pub hh_id: String,
-    pub file_id: i64,
-    pub file_name: String,
-    pub file_path: String,
-    pub similarity_score: f64,
-    pub match_date: String,
 }
 
 #[derive(Debug, Clone)]
@@ -141,6 +123,17 @@ impl Database {
             [],
         )?;
 
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS file_vectors (
+                file_id INTEGER PRIMARY KEY,
+                fingerprint INTEGER NOT NULL,
+                vector_blob BLOB NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+            )",
+            [],
+        )?;
+
         // Create indices for better query performance
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_files_path ON files(file_path)",
@@ -167,26 +160,12 @@ impl Database {
             [],
         )?;
 
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_file_vectors_fingerprint ON file_vectors(fingerprint)",
+            [],
+        )?;
+
         Ok(())
-    }
-
-    pub fn insert_file(&self, file_path: &str, file_name: &str) -> Result<i64> {
-        let scan_date = Utc::now().to_rfc3339();
-
-        // Try to insert, if it exists, return the existing id
-        match self.conn.execute(
-            "INSERT INTO files (file_path, file_name, scan_date) VALUES (?1, ?2, ?3)",
-            params![file_path, file_name, scan_date],
-        ) {
-            Ok(_) => Ok(self.conn.last_insert_rowid()),
-            Err(rusqlite::Error::SqliteFailure(err, _))
-                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
-            {
-                // File already exists, get its id
-                self.get_file_id(file_path)
-            }
-            Err(e) => Err(e),
-        }
     }
 
     pub fn start_file_import(&mut self) -> Result<FileImportSession<'_>> {
@@ -219,14 +198,13 @@ impl Database {
     pub fn get_all_files(&self) -> Result<Vec<FileRecord>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, file_path, file_name, scan_date FROM files ORDER BY file_name")?;
+            .prepare("SELECT id, file_path, file_name FROM files ORDER BY file_name")?;
 
         let files = stmt.query_map([], |row| {
             Ok(FileRecord {
                 id: row.get(0)?,
                 file_path: row.get(1)?,
                 file_name: row.get(2)?,
-                scan_date: row.get(3)?,
             })
         })?;
 
@@ -236,35 +214,6 @@ impl Database {
     pub fn get_file_count(&self) -> Result<usize> {
         self.conn
             .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
-    }
-
-    pub fn get_all_matches(&self, min_similarity: f64) -> Result<Vec<MatchRecord>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.hh_id, m.file_id, f.file_name, f.file_path, m.similarity_score, m.match_date
-             FROM matches m
-             JOIN files f ON m.file_id = f.id
-             WHERE m.similarity_score >= ?1
-             ORDER BY m.similarity_score DESC"
-        )?;
-
-        let matches = stmt.query_map(params![min_similarity], |row| {
-            Ok(MatchRecord {
-                id: row.get(0)?,
-                hh_id: row.get(1)?,
-                file_id: row.get(2)?,
-                file_name: row.get(3)?,
-                file_path: row.get(4)?,
-                similarity_score: row.get(5)?,
-                match_date: row.get(6)?,
-            })
-        })?;
-
-        matches.collect()
-    }
-
-    pub fn clear_matches(&self) -> Result<()> {
-        self.conn.execute("DELETE FROM matches", [])?;
-        Ok(())
     }
 
     pub fn clear_matches_for_id(&self, hh_id: &str) -> Result<()> {
@@ -285,29 +234,12 @@ impl Database {
         Ok(ReferenceImportSession { tx })
     }
 
-    pub fn insert_reference_id(&self, hh_id: &str) -> Result<bool> {
-        let import_date = Utc::now().to_rfc3339();
-
-        // Use INSERT OR IGNORE to skip duplicates and report whether a new row was added
-        let changed = self.conn.execute(
-            "INSERT OR IGNORE INTO reference_ids (hh_id, import_date) VALUES (?1, ?2)",
-            params![hh_id, import_date],
-        )?;
-        Ok(changed > 0)
-    }
-
-    pub fn get_all_reference_ids(&self) -> Result<Vec<ReferenceId>> {
+    pub fn get_all_reference_ids(&self) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, hh_id, import_date FROM reference_ids ORDER BY hh_id")?;
+            .prepare("SELECT hh_id FROM reference_ids ORDER BY hh_id")?;
 
-        let ids = stmt.query_map([], |row| {
-            Ok(ReferenceId {
-                id: row.get(0)?,
-                hh_id: row.get(1)?,
-                import_date: row.get(2)?,
-            })
-        })?;
+        let ids = stmt.query_map([], |row| row.get(0))?;
 
         ids.collect()
     }
@@ -315,11 +247,6 @@ impl Database {
     pub fn get_reference_id_count(&self) -> Result<usize> {
         self.conn
             .query_row("SELECT COUNT(*) FROM reference_ids", [], |row| row.get(0))
-    }
-
-    pub fn clear_reference_ids(&self) -> Result<()> {
-        self.conn.execute("DELETE FROM reference_ids", [])?;
-        Ok(())
     }
 
     // Search for a single household ID against all files
@@ -343,5 +270,52 @@ impl Database {
         })?;
 
         results.collect()
+    }
+
+    pub fn get_file_vector(&self, file_id: i64, fingerprint: u64) -> Result<Option<Vec<f32>>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT fingerprint, vector_blob FROM file_vectors WHERE file_id = ?1",
+        )?;
+        let row = stmt
+            .query_row(params![file_id], |row| {
+                let stored: i64 = row.get(0)?;
+                let blob: Vec<u8> = row.get(1)?;
+                Ok((stored as u64, blob))
+            })
+            .optional()?;
+
+        if let Some((stored_fingerprint, blob)) = row {
+            if stored_fingerprint == fingerprint {
+                if blob.len() % std::mem::size_of::<f32>() != 0 {
+                    return Ok(None);
+                }
+                let floats = cast_slice::<u8, f32>(&blob).to_vec();
+                return Ok(Some(floats));
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub fn upsert_file_vector(&self, file_id: i64, fingerprint: u64, data: &[f32]) -> Result<()> {
+        let blob = cast_slice(data);
+        self.conn.execute(
+            "INSERT INTO file_vectors (file_id, fingerprint, vector_blob, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(file_id) DO UPDATE SET
+                 fingerprint=excluded.fingerprint,
+                 vector_blob=excluded.vector_blob,
+                 updated_at=excluded.updated_at",
+            params![file_id, fingerprint as i64, blob, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn cleanup_orphan_vectors(&self) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM file_vectors WHERE file_id NOT IN (SELECT id FROM files)",
+            [],
+        )?;
+        Ok(())
     }
 }

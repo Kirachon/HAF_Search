@@ -19,7 +19,7 @@ pub fn open_file_location(file_path: &str) -> Result<(), String> {
     {
         // On Windows, use explorer.exe with /select flag to highlight the file
         let result = Command::new("explorer")
-            .args(["/select,", &file_path])
+            .args(["/select,", file_path])
             .spawn();
 
         match result {
@@ -46,27 +46,27 @@ pub fn open_file_location(file_path: &str) -> Result<(), String> {
         let dir_str = _dir.to_string_lossy();
 
         // Try xdg-open first (most common)
-        if let Ok(_) = Command::new("xdg-open").arg(&*dir_str).spawn() {
+        if Command::new("xdg-open").arg(&*dir_str).spawn().is_ok() {
             return Ok(());
         }
 
         // Try nautilus (GNOME)
-        if let Ok(_) = Command::new("nautilus").arg(&*dir_str).spawn() {
+        if Command::new("nautilus").arg(&*dir_str).spawn().is_ok() {
             return Ok(());
         }
 
         // Try dolphin (KDE)
-        if let Ok(_) = Command::new("dolphin").arg(&*dir_str).spawn() {
+        if Command::new("dolphin").arg(&*dir_str).spawn().is_ok() {
             return Ok(());
         }
 
         // Try thunar (XFCE)
-        if let Ok(_) = Command::new("thunar").arg(&*dir_str).spawn() {
+        if Command::new("thunar").arg(&*dir_str).spawn().is_ok() {
             return Ok(());
         }
 
         // Try nemo (Cinnamon)
-        if let Ok(_) = Command::new("nemo").arg(&*dir_str).spawn() {
+        if Command::new("nemo").arg(&*dir_str).spawn().is_ok() {
             return Ok(());
         }
 
@@ -78,11 +78,6 @@ pub fn open_file_location(file_path: &str) -> Result<(), String> {
         // Fallback for other platforms - just open the directory
         open::that(_dir).map_err(|e| format!("Failed to open directory: {}", e))
     }
-}
-
-/// Simple wrapper to open a directory (not selecting a specific file)
-pub fn open_directory(dir_path: &str) -> Result<(), String> {
-    open::that(dir_path).map_err(|e| format!("Failed to open directory: {}", e))
 }
 
 #[cfg(test)]
