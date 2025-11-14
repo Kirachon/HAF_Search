@@ -31,15 +31,34 @@ impl<'conn> FileImportSession<'conn> {
 }
 
 impl<'conn> MatchImportSession<'conn> {
+    /// Clear all matches in the database (use with caution - prefer clear_for_ids for incremental updates)
+    #[allow(dead_code)]
     pub fn clear_all(&mut self) -> Result<()> {
         self.tx.execute("DELETE FROM matches", [])?;
+        Ok(())
+    }
+
+    pub fn clear_for_ids(&mut self, hh_ids: &[String]) -> Result<()> {
+        if hh_ids.is_empty() {
+            return Ok(());
+        }
+
+        // Build placeholders for the IN clause
+        let placeholders = hh_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let query = format!("DELETE FROM matches WHERE hh_id IN ({})", placeholders);
+
+        // Convert hh_ids to params
+        let params: Vec<&dyn rusqlite::ToSql> = hh_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+
+        self.tx.execute(&query, params.as_slice())?;
         Ok(())
     }
 
     pub fn insert_match(&mut self, hh_id: &str, file_id: i64, similarity_score: f64) -> Result<()> {
         let match_date = Utc::now().to_rfc3339();
         self.tx.execute(
-            "INSERT INTO matches (hh_id, file_id, similarity_score, match_date) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO matches (hh_id, file_id, similarity_score, match_date) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(hh_id, file_id) DO UPDATE SET similarity_score=excluded.similarity_score, match_date=excluded.match_date",
             params![hh_id, file_id, similarity_score, match_date],
         )?;
         Ok(())
@@ -165,6 +184,12 @@ impl Database {
             [],
         )?;
 
+        // Add unique constraint to prevent duplicate matches
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_matches_unique ON matches(hh_id, file_id)",
+            [],
+        )?;
+
         Ok(())
     }
 
@@ -189,7 +214,8 @@ impl Database {
     pub fn insert_match(&self, hh_id: &str, file_id: i64, similarity_score: f64) -> Result<()> {
         let match_date = Utc::now().to_rfc3339();
         self.conn.execute(
-            "INSERT INTO matches (hh_id, file_id, similarity_score, match_date) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO matches (hh_id, file_id, similarity_score, match_date) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(hh_id, file_id) DO UPDATE SET similarity_score=excluded.similarity_score, match_date=excluded.match_date",
             params![hh_id, file_id, similarity_score, match_date],
         )?;
         Ok(())

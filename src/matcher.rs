@@ -143,8 +143,9 @@ impl Matcher {
             .start_match_import()
             .map_err(|e| format!("Failed to start match transaction: {}", e))?;
 
+        // Clear only matches for the hh_ids being processed (incremental update)
         session
-            .clear_all()
+            .clear_for_ids(hh_ids)
             .map_err(|e| format!("Failed to clear previous matches: {}", e))?;
 
         for match_result in matches {
