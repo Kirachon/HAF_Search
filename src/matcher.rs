@@ -1,6 +1,7 @@
 use crate::database::{Database, FileRecord};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
+use log::info;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -81,6 +82,8 @@ impl Matcher {
         let total = hh_ids.len();
         let processed = Arc::new(AtomicUsize::new(0));
         let progress_callback = self.progress_callback.clone();
+        let log_progress = progress_callback.is_none() && total > 0;
+        let log_step = if total > 0 { (total / 20).max(1) } else { 1 };
 
         let file_contexts: Vec<FileMatchContext> = files
             .par_iter()
@@ -89,6 +92,16 @@ impl Matcher {
 
         if file_contexts.is_empty() {
             return Vec::new();
+        }
+
+        if let Some(ref callback) = progress_callback {
+            if total > 0 {
+                if let Ok(mut cb) = callback.lock() {
+                    cb(0, total);
+                }
+            }
+        } else if log_progress {
+            info!("CPU matching progress: 0% (0 / {} IDs)", total);
         }
 
         // Perform matching in parallel
@@ -104,11 +117,24 @@ impl Matcher {
                     chunk_results.extend(matches_for_id);
                 }
 
+                let completed = processed.fetch_add(chunk.len(), Ordering::Relaxed) + chunk.len();
+
                 if let Some(ref callback) = progress_callback {
-                    let completed =
-                        processed.fetch_add(chunk.len(), Ordering::Relaxed) + chunk.len();
                     if let Ok(mut cb) = callback.lock() {
                         cb(completed.min(total), total);
+                    }
+                } else if log_progress {
+                    let should_log = completed.is_multiple_of(log_step) || completed >= total;
+                    if should_log {
+                        let percent = ((completed as f64 / total as f64) * 100.0)
+                            .round()
+                            .clamp(0.0, 100.0) as usize;
+                        info!(
+                            "CPU matching progress: {}% ({} / {} IDs)",
+                            percent,
+                            completed.min(total),
+                            total
+                        );
                     }
                 }
 
@@ -134,6 +160,12 @@ impl Matcher {
         if files.is_empty() {
             return Err("No files found in database. Please scan a directory first.".to_string());
         }
+
+        info!(
+            "CPU match pass started: {} household IDs across {} files",
+            hh_ids.len(),
+            files.len()
+        );
 
         // Perform matching
         let matches = self.match_ids(hh_ids, &files, min_similarity);
@@ -161,6 +193,12 @@ impl Matcher {
         session
             .commit()
             .map_err(|e| format!("Failed to commit matches: {}", e))?;
+
+        info!(
+            "CPU match pass complete: {} matches stored for {} household IDs",
+            count,
+            hh_ids.len()
+        );
 
         Ok(count)
     }

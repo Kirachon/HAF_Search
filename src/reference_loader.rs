@@ -1,5 +1,6 @@
 use crate::database::Database;
 use csv::ReaderBuilder;
+use log::info;
 use std::fs;
 use std::fs::File;
 
@@ -33,6 +34,12 @@ impl ReferenceLoader {
             fs::metadata(csv_path).map_err(|e| format!("Failed to read CSV metadata: {}", e))?;
         let total_bytes = metadata.len().max(1);
 
+        info!(
+            "Starting CSV import from '{}' ({} bytes)",
+            csv_path,
+            metadata.len()
+        );
+
         let file = File::open(csv_path).map_err(|e| format!("Failed to open CSV file: {}", e))?;
 
         let mut reader = ReaderBuilder::new().has_headers(true).from_reader(file);
@@ -57,6 +64,14 @@ impl ReferenceLoader {
         let mut import_session = db
             .start_reference_import()
             .map_err(|e| format!("Failed to start reference ID transaction: {}", e))?;
+
+        let mut last_logged_percent = 0usize;
+
+        if let Some(cb) = progress_callback.as_mut() {
+            cb(0, 0, total_bytes);
+        } else {
+            info!("CSV import progress: 0% (0 rows processed)");
+        }
 
         loop {
             match reader.read_record(&mut record) {
@@ -96,9 +111,22 @@ impl ReferenceLoader {
                 }
             }
 
+            let bytes_read = reader.position().byte();
             if let Some(cb) = progress_callback.as_mut() {
-                let bytes_read = reader.position().byte();
                 cb(processed, bytes_read, total_bytes);
+            } else {
+                let percent = ((bytes_read as f64 / total_bytes as f64) * 100.0)
+                    .round()
+                    .clamp(0.0, 100.0) as usize;
+                if percent >= last_logged_percent.saturating_add(5)
+                    || (percent == 100 && percent != last_logged_percent)
+                {
+                    info!(
+                        "CSV import progress: {}% ({} rows processed)",
+                        percent, processed
+                    );
+                    last_logged_percent = percent;
+                }
             }
         }
 
@@ -110,6 +138,11 @@ impl ReferenceLoader {
         import_session
             .commit()
             .map_err(|e| format!("Failed to commit reference IDs: {}", e))?;
+
+        info!(
+            "CSV import complete: processed {} rows (inserted {}, skipped {})",
+            processed, inserted, skipped
+        );
 
         Ok(ReferenceLoadReport {
             processed,
