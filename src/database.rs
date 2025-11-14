@@ -48,7 +48,8 @@ impl<'conn> MatchImportSession<'conn> {
         let query = format!("DELETE FROM matches WHERE hh_id IN ({})", placeholders);
 
         // Convert hh_ids to params
-        let params: Vec<&dyn rusqlite::ToSql> = hh_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let params: Vec<&dyn rusqlite::ToSql> =
+            hh_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
 
         self.tx.execute(&query, params.as_slice())?;
         Ok(())
