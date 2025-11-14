@@ -78,8 +78,6 @@ impl ReferenceLoader {
             .start_reference_import()
             .map_err(|e| format!("Failed to start reference ID transaction: {}", e))?;
 
-        let mut last_logged_percent = 0usize;
-
         loop {
             match reader.read_record(&mut record) {
                 Ok(true) => {
