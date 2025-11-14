@@ -331,6 +331,8 @@ struct ProgressTracker {
     completed_work: usize,
     total_tiles: usize,
     completed_tiles: usize,
+    last_logged_percent: usize,
+    last_logged_ids: usize,
 }
 
 impl ProgressTracker {
@@ -341,6 +343,8 @@ impl ProgressTracker {
             completed_work: 0,
             total_tiles: 0,
             completed_tiles: 0,
+            last_logged_percent: 0,
+            last_logged_ids: 0,
         }
     }
 
@@ -366,17 +370,58 @@ impl ProgressTracker {
         self.emit(progress);
     }
 
-    fn emit(&self, progress: Option<&MatchProgressCallback>) {
+    fn emit(&mut self, progress: Option<&MatchProgressCallback>) {
         if let Some(callback) = progress {
             if let Ok(mut cb) = callback.lock() {
-                let ratio = if self.total_work == 0 {
-                    1.0
-                } else {
-                    (self.completed_work as f64 / self.total_work as f64).clamp(0.0, 1.0)
-                };
-                let mapped = (ratio * self.total_queries as f64).ceil() as usize;
-                cb(mapped.min(self.total_queries), self.total_queries);
+                let (ids_done, percent) = self.progress_metrics();
+                cb(ids_done, self.total_queries);
+                self.maybe_log(ids_done, percent);
+                return;
             }
+        }
+
+        let (ids_done, percent) = self.progress_metrics();
+        self.maybe_log(ids_done, percent);
+    }
+
+    fn progress_metrics(&self) -> (usize, usize) {
+        if self.total_queries == 0 {
+            return (0, 100);
+        }
+
+        if self.total_work == 0 {
+            return (self.total_queries, 100);
+        }
+
+        let ratio = (self.completed_work as f64 / self.total_work as f64).clamp(0.0, 1.0);
+        let ids_done =
+            ((ratio * self.total_queries as f64).ceil() as usize).min(self.total_queries);
+        let percent = ((ids_done as f64 / self.total_queries as f64) * 100.0)
+            .round()
+            .clamp(0.0, 100.0) as usize;
+        (ids_done, percent)
+    }
+
+    fn maybe_log(&mut self, ids_done: usize, percent: usize) {
+        if self.total_queries == 0 {
+            return;
+        }
+
+        let should_log = percent >= self.last_logged_percent.saturating_add(5)
+            || ids_done > self.last_logged_ids
+            || (percent == 100 && percent != self.last_logged_percent);
+
+        if should_log {
+            info!(
+                "GPU matching progress: {}% ({} / {} IDs, {} / {} tiles)",
+                percent,
+                ids_done,
+                self.total_queries,
+                self.completed_tiles.min(self.total_tiles),
+                self.total_tiles.max(1)
+            );
+            self.last_logged_percent = percent;
+            self.last_logged_ids = ids_done;
         }
     }
 }
@@ -440,6 +485,15 @@ impl MatchEngine for GpuMatchEngine {
             .iter()
             .map(|record| (record.id, record.file_name.clone()))
             .collect();
+
+        info!(
+            "GPU match pass started: {} household IDs across {} files (query chunk: {}, file chunk: {}, in-flight tiles: {})",
+            hh_ids.len(),
+            file_pairs.len(),
+            self.chunk_size.max(1),
+            self.file_chunk_size.max(1),
+            self.inflight_limit
+        );
 
         db.cleanup_orphan_vectors()
             .map_err(|e| format!("Failed to clean vector cache: {}", e))?;
@@ -529,12 +583,12 @@ impl MatchEngine for GpuMatchEngine {
             .commit()
             .map_err(|e| format!("Failed to commit GPU matches: {}", e))?;
 
-        let total_matches = all_matches.len();
         info!(
-            "GPU matching finished: stored {} matches for {} household IDs",
-            total_matches, total_queries
+            "GPU match pass complete: {} matches persisted for {} household IDs",
+            all_matches.len(),
+            hh_ids.len()
         );
 
-        Ok(total_matches)
+        Ok(all_matches.len())
     }
 }

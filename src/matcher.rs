@@ -82,6 +82,8 @@ impl Matcher {
         let total = hh_ids.len();
         let processed = Arc::new(AtomicUsize::new(0));
         let progress_callback = self.progress_callback.clone();
+        let log_progress = progress_callback.is_none() && total > 0;
+        let log_step = if total > 0 { (total / 20).max(1) } else { 1 };
 
         let file_contexts: Vec<FileMatchContext> = files
             .par_iter()
@@ -105,11 +107,24 @@ impl Matcher {
                     chunk_results.extend(matches_for_id);
                 }
 
+                let completed = processed.fetch_add(chunk.len(), Ordering::Relaxed) + chunk.len();
+
                 if let Some(ref callback) = progress_callback {
-                    let completed =
-                        processed.fetch_add(chunk.len(), Ordering::Relaxed) + chunk.len();
                     if let Ok(mut cb) = callback.lock() {
                         cb(completed.min(total), total);
+                    }
+                } else if log_progress {
+                    let should_log = completed.is_multiple_of(log_step) || completed >= total;
+                    if should_log {
+                        let percent = ((completed as f64 / total as f64) * 100.0)
+                            .round()
+                            .clamp(0.0, 100.0) as usize;
+                        info!(
+                            "CPU matching progress: {}% ({} / {} IDs)",
+                            percent,
+                            completed.min(total),
+                            total
+                        );
                     }
                 }
 
@@ -137,7 +152,7 @@ impl Matcher {
         }
 
         info!(
-            "CPU matcher evaluating {} household IDs against {} files",
+            "CPU match pass started: {} household IDs across {} files",
             hh_ids.len(),
             files.len()
         );
@@ -170,7 +185,7 @@ impl Matcher {
             .map_err(|e| format!("Failed to commit matches: {}", e))?;
 
         info!(
-            "CPU matcher persisted {} matches for {} household IDs",
+            "CPU match pass complete: {} matches stored for {} household IDs",
             count,
             hh_ids.len()
         );
