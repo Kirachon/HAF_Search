@@ -252,7 +252,7 @@ impl SimilarityComputer {
             return Err("Requested file chunk exceeds GPU buffer size".to_string());
         }
 
-        let query_bytes = query_vectors.len() * std::mem::size_of::<f32>();
+        let query_bytes = std::mem::size_of_val(query_vectors);
         if query_bytes == 0 {
             return Ok(GpuTileHandle::immediate(Ok(Vec::new())));
         }
@@ -351,8 +351,8 @@ impl SimilarityComputer {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            let x_groups = (query_len as u32 + WORKGROUP_X - 1) / WORKGROUP_X;
-            let y_groups = (file_len as u32 + WORKGROUP_Y - 1) / WORKGROUP_Y;
+            let x_groups = (query_len as u32).div_ceil(WORKGROUP_X);
+            let y_groups = (file_len as u32).div_ceil(WORKGROUP_Y);
             pass.dispatch_workgroups(x_groups.max(1), y_groups.max(1), 1);
         }
 

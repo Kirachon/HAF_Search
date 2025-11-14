@@ -63,6 +63,17 @@ impl Scanner {
             })
             .count();
         let processed = Arc::new(AtomicUsize::new(0));
+        let mut progress = self.progress_callback.clone();
+
+        if total > 0 && progress.is_none() {
+            progress = Some(Self::logging_progress(total));
+        }
+
+        if let Some(ref cb_handle) = progress {
+            if let Ok(mut cb) = cb_handle.lock() {
+                cb(0, total);
+            }
+        }
 
         // Second pass: filter TIFF files in parallel
         let tiff_files: Vec<TiffFile> = WalkDir::new(path)
@@ -94,7 +105,7 @@ impl Scanner {
                             .to_string_lossy()
                             .to_string();
 
-                        Self::report_progress(&self.progress_callback, &processed, total);
+                        Self::report_progress(&progress, &processed, total);
 
                         return Some(TiffFile {
                             path: path.to_path_buf(),
@@ -103,7 +114,7 @@ impl Scanner {
                     }
                 }
 
-                Self::report_progress(&self.progress_callback, &processed, total);
+                Self::report_progress(&progress, &processed, total);
 
                 None
             })
@@ -185,6 +196,44 @@ impl Scanner {
                 );
             }
         }
+    }
+
+    fn logging_progress(total: usize) -> ProgressCallback {
+        let mut last_percent: Option<usize> = None;
+        Arc::new(Mutex::new(
+            move |completed: usize, reported_total: usize| {
+                let display_total = if reported_total == 0 {
+                    total
+                } else {
+                    reported_total
+                };
+                let total_for_percent = display_total.max(1);
+                let done_for_percent = completed.min(total_for_percent);
+                let percent = ((done_for_percent as f64 / total_for_percent as f64) * 100.0)
+                    .round()
+                    .clamp(0.0, 100.0) as usize;
+                let should_log = match last_percent {
+                    Some(prev) => {
+                        percent >= prev.saturating_add(5) || (percent == 100 && percent != prev)
+                    }
+                    None => true,
+                };
+
+                if should_log {
+                    let display_done = if display_total == 0 {
+                        completed
+                    } else {
+                        completed.min(display_total)
+                    };
+                    let display_total_value = if display_total == 0 { 0 } else { display_total };
+                    info!(
+                        "Scanning progress: {}% ({} / {} files walked)",
+                        percent, display_done, display_total_value
+                    );
+                    last_percent = Some(percent);
+                }
+            },
+        ))
     }
 }
 
