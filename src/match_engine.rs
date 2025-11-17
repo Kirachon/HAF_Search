@@ -7,7 +7,7 @@ use log::info;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use wgpu::Buffer;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +35,49 @@ pub fn create_engine(kind: MatchEngineKind) -> Result<Box<dyn MatchEngine>, Stri
         MatchEngineKind::Cpu => Ok(Box::new(CpuMatchEngine::default())),
         MatchEngineKind::Gpu => Ok(Box::new(GpuMatchEngine::new()?)),
     }
+}
+
+fn make_logging_progress_callback(
+    activity: &'static str,
+    unit_label: &'static str,
+    total_hint: usize,
+) -> MatchProgressCallback {
+    let mut last_percent: Option<usize> = None;
+    Arc::new(Mutex::new(move |completed: usize, total: usize| {
+        let total_units = if total == 0 { total_hint.max(1) } else { total };
+        let display_total = if total == 0 { total_hint } else { total };
+        let done_units = if display_total == 0 {
+            completed
+        } else {
+            completed.min(display_total)
+        };
+
+        let percent = if total_units == 0 {
+            100
+        } else {
+            ((done_units.min(total_units) as f64 / total_units as f64) * 100.0)
+                .round()
+                .clamp(0.0, 100.0) as usize
+        };
+
+        let should_log = match last_percent {
+            Some(prev) => percent >= prev.saturating_add(5) || (percent == 100 && percent != prev),
+            None => true,
+        };
+
+        if should_log {
+            let display_total_value = if display_total == 0 {
+                total_hint.max(1)
+            } else {
+                display_total
+            };
+            info!(
+                "{} progress: {}% ({} / {} {})",
+                activity, percent, done_units, display_total_value, unit_label
+            );
+            last_percent = Some(percent);
+        }
+    }))
 }
 
 fn env_chunk(key: &str, default: usize) -> usize {

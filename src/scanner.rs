@@ -197,6 +197,44 @@ impl Scanner {
             }
         }
     }
+
+    fn logging_progress(total: usize) -> ProgressCallback {
+        let mut last_percent: Option<usize> = None;
+        Arc::new(Mutex::new(
+            move |completed: usize, reported_total: usize| {
+                let display_total = if reported_total == 0 {
+                    total
+                } else {
+                    reported_total
+                };
+                let total_for_percent = display_total.max(1);
+                let done_for_percent = completed.min(total_for_percent);
+                let percent = ((done_for_percent as f64 / total_for_percent as f64) * 100.0)
+                    .round()
+                    .clamp(0.0, 100.0) as usize;
+                let should_log = match last_percent {
+                    Some(prev) => {
+                        percent >= prev.saturating_add(5) || (percent == 100 && percent != prev)
+                    }
+                    None => true,
+                };
+
+                if should_log {
+                    let display_done = if display_total == 0 {
+                        completed
+                    } else {
+                        completed.min(display_total)
+                    };
+                    let display_total_value = if display_total == 0 { 0 } else { display_total };
+                    info!(
+                        "Scanning progress: {}% ({} / {} files walked)",
+                        percent, display_done, display_total_value
+                    );
+                    last_percent = Some(percent);
+                }
+            },
+        ))
+    }
 }
 
 impl Default for Scanner {
