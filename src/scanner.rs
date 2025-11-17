@@ -1,4 +1,6 @@
 use crate::database::Database;
+use crate::matcher::ProgressCallback;
+use crate::progress::logging_progress_callback;
 use log::{info, warn};
 use rayon::iter::ParallelBridge;
 use rayon::prelude::*;
@@ -6,8 +8,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use walkdir::WalkDir;
-
-type ProgressCallback = Arc<Mutex<dyn FnMut(usize, usize) + Send>>;
 
 #[derive(Debug, Clone)]
 pub struct TiffFile {
@@ -63,6 +63,17 @@ impl Scanner {
             })
             .count();
         let processed = Arc::new(AtomicUsize::new(0));
+        let mut progress = self.progress_callback.clone();
+
+        if total > 0 && progress.is_none() {
+            progress = Some(logging_progress_callback("Scanning", "files walked", total));
+        }
+
+        if let Some(ref cb_handle) = progress {
+            if let Ok(mut cb) = cb_handle.lock() {
+                cb(0, total);
+            }
+        }
 
         // Second pass: filter TIFF files in parallel
         let tiff_files: Vec<TiffFile> = WalkDir::new(path)
@@ -94,7 +105,7 @@ impl Scanner {
                             .to_string_lossy()
                             .to_string();
 
-                        Self::report_progress(&self.progress_callback, &processed, total);
+                        Self::report_progress(&progress, &processed, total);
 
                         return Some(TiffFile {
                             path: path.to_path_buf(),
@@ -103,7 +114,7 @@ impl Scanner {
                     }
                 }
 
-                Self::report_progress(&self.progress_callback, &processed, total);
+                Self::report_progress(&progress, &processed, total);
 
                 None
             })

@@ -1,6 +1,7 @@
 use crate::database::{Database, FileRecord};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
+use log::info;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -135,6 +136,12 @@ impl Matcher {
             return Err("No files found in database. Please scan a directory first.".to_string());
         }
 
+        info!(
+            "CPU matcher evaluating {} household IDs against {} files",
+            hh_ids.len(),
+            files.len()
+        );
+
         // Perform matching
         let matches = self.match_ids(hh_ids, &files, min_similarity);
         let count = matches.len();
@@ -161,6 +168,12 @@ impl Matcher {
         session
             .commit()
             .map_err(|e| format!("Failed to commit matches: {}", e))?;
+
+        info!(
+            "CPU matcher persisted {} matches for {} household IDs",
+            count,
+            hh_ids.len()
+        );
 
         Ok(count)
     }

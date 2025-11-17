@@ -1,5 +1,6 @@
 use crate::database::Database;
 use csv::ReaderBuilder;
+use log::info;
 use std::fs;
 use std::fs::File;
 
@@ -24,7 +25,7 @@ impl ReferenceLoader {
         &self,
         csv_path: &str,
         db: &mut Database,
-        mut progress_callback: Option<F>,
+        progress_callback: Option<F>,
     ) -> Result<ReferenceLoadReport, String>
     where
         F: FnMut(usize, u64, u64),
@@ -32,6 +33,12 @@ impl ReferenceLoader {
         let metadata =
             fs::metadata(csv_path).map_err(|e| format!("Failed to read CSV metadata: {}", e))?;
         let total_bytes = metadata.len().max(1);
+
+        info!(
+            "Starting CSV import from '{}' ({} bytes)",
+            csv_path,
+            metadata.len()
+        );
 
         let file = File::open(csv_path).map_err(|e| format!("Failed to open CSV file: {}", e))?;
 
@@ -53,6 +60,19 @@ impl ReferenceLoader {
         let mut errors = Vec::new();
 
         let mut record = csv::StringRecord::new();
+        let mut user_callback = progress_callback;
+        let mut logger = None;
+
+        if user_callback.is_none() {
+            logger = Some(CsvLogger::new(csv_path, total_bytes));
+        }
+
+        if let Some(cb) = user_callback.as_mut() {
+            cb(0, 0, total_bytes);
+        } else if let Some(ref mut log) = logger {
+            log.report(0, 0, total_bytes);
+        }
+
         let mut line_index = 0usize;
         let mut import_session = db
             .start_reference_import()
@@ -96,9 +116,11 @@ impl ReferenceLoader {
                 }
             }
 
-            if let Some(cb) = progress_callback.as_mut() {
-                let bytes_read = reader.position().byte();
+            let bytes_read = reader.position().byte();
+            if let Some(cb) = user_callback.as_mut() {
                 cb(processed, bytes_read, total_bytes);
+            } else if let Some(ref mut log) = logger {
+                log.report(processed, bytes_read, total_bytes);
             }
         }
 
@@ -111,11 +133,55 @@ impl ReferenceLoader {
             .commit()
             .map_err(|e| format!("Failed to commit reference IDs: {}", e))?;
 
+        if let Some(ref mut log) = logger {
+            log.report(processed, total_bytes, total_bytes);
+        }
+
+        info!(
+            "CSV import complete: processed {} rows (inserted {}, skipped {})",
+            processed, inserted, skipped
+        );
+
         Ok(ReferenceLoadReport {
             processed,
             inserted,
             skipped,
             errors,
         })
+    }
+}
+
+struct CsvLogger {
+    path: String,
+    total_hint: u64,
+    last_percent: Option<usize>,
+}
+
+impl CsvLogger {
+    fn new(path: &str, total_hint: u64) -> Self {
+        Self {
+            path: path.to_string(),
+            total_hint,
+            last_percent: None,
+        }
+    }
+
+    fn report(&mut self, rows: usize, bytes_read: u64, reported_total: u64) {
+        let total_for_percent = reported_total.max(self.total_hint).max(1);
+        let percent = ((bytes_read as f64 / total_for_percent as f64) * 100.0)
+            .round()
+            .clamp(0.0, 100.0) as usize;
+        let should_log = match self.last_percent {
+            Some(prev) => percent >= prev.saturating_add(5) || (percent == 100 && percent != prev),
+            None => true,
+        };
+
+        if should_log {
+            info!(
+                "CSV import progress ({}): {}% ({} rows processed, {} / {} bytes)",
+                self.path, percent, rows, bytes_read, total_for_percent
+            );
+            self.last_percent = Some(percent);
+        }
     }
 }
