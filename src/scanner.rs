@@ -166,8 +166,9 @@ impl Scanner {
         processed: &Arc<AtomicUsize>,
         total: usize,
     ) {
+        let current = processed.fetch_add(1, Ordering::Relaxed) + 1;
+
         if let Some(ref cb_handle) = callback {
-            let current = processed.fetch_add(1, Ordering::Relaxed) + 1;
             if total == 0 {
                 if let Ok(mut cb) = cb_handle.lock() {
                     cb(0, 0);
@@ -180,6 +181,19 @@ impl Scanner {
                 if let Ok(mut cb) = cb_handle.lock() {
                     cb(current.min(total), total);
                 }
+            }
+        } else if total > 0 {
+            let step = (total / 20).max(1);
+            if current.is_multiple_of(step) || current >= total {
+                let percent = ((current as f64 / total as f64) * 100.0)
+                    .round()
+                    .clamp(0.0, 100.0) as usize;
+                info!(
+                    "Scanning progress: {}% ({} / {} files walked)",
+                    percent,
+                    current.min(total),
+                    total
+                );
             }
         }
     }
