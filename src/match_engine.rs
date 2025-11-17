@@ -1,6 +1,7 @@
 use crate::database::Database;
 use crate::gpu::{GpuTileHandle, SimilarityComputer};
 use crate::matcher::{MatchResult, Matcher, ProgressCallback as MatcherProgressCallback};
+use crate::progress::logging_progress_callback;
 use crate::vectorizer::{Vectorizer, VECTOR_SIZE};
 use log::info;
 use std::collections::hash_map::DefaultHasher;
@@ -108,11 +109,7 @@ impl MatchEngine for CpuMatchEngine {
         let mut progress = progress_callback;
 
         if total_ids > 0 && progress.is_none() {
-            progress = Some(make_logging_progress_callback(
-                "CPU matching",
-                "IDs",
-                total_ids,
-            ));
+            progress = Some(logging_progress_callback("CPU matching", "IDs", total_ids));
         }
 
         if let Some(ref callback) = progress {
@@ -468,7 +465,7 @@ impl MatchEngine for GpuMatchEngine {
         }
 
         if progress.is_none() {
-            progress = Some(make_logging_progress_callback(
+            progress = Some(logging_progress_callback(
                 "GPU matching",
                 "IDs",
                 total_queries,
@@ -583,12 +580,12 @@ impl MatchEngine for GpuMatchEngine {
             .commit()
             .map_err(|e| format!("Failed to commit GPU matches: {}", e))?;
 
+        let total_matches = all_matches.len();
         info!(
-            "GPU match pass complete: {} matches persisted for {} household IDs",
-            all_matches.len(),
-            hh_ids.len()
+            "GPU matching finished: stored {} matches for {} household IDs",
+            total_matches, total_queries
         );
 
-        Ok(all_matches.len())
+        Ok(total_matches)
     }
 }

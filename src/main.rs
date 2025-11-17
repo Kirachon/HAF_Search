@@ -4,6 +4,7 @@ mod gui;
 mod match_engine;
 mod matcher;
 mod opener;
+mod progress;
 mod reference_loader;
 mod scanner;
 mod searcher;

@@ -1,4 +1,6 @@
 use crate::database::Database;
+use crate::matcher::ProgressCallback;
+use crate::progress::logging_progress_callback;
 use log::{info, warn};
 use rayon::iter::ParallelBridge;
 use rayon::prelude::*;
@@ -6,8 +8,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use walkdir::WalkDir;
-
-type ProgressCallback = Arc<Mutex<dyn FnMut(usize, usize) + Send>>;
 
 #[derive(Debug, Clone)]
 pub struct TiffFile {
@@ -66,7 +66,7 @@ impl Scanner {
         let mut progress = self.progress_callback.clone();
 
         if total > 0 && progress.is_none() {
-            progress = Some(Self::logging_progress(total));
+            progress = Some(logging_progress_callback("Scanning", "files walked", total));
         }
 
         if let Some(ref cb_handle) = progress {

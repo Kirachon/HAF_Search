@@ -152,7 +152,7 @@ impl Matcher {
         }
 
         info!(
-            "CPU match pass started: {} household IDs across {} files",
+            "CPU matcher evaluating {} household IDs against {} files",
             hh_ids.len(),
             files.len()
         );
@@ -185,7 +185,7 @@ impl Matcher {
             .map_err(|e| format!("Failed to commit matches: {}", e))?;
 
         info!(
-            "CPU match pass complete: {} matches stored for {} household IDs",
+            "CPU matcher persisted {} matches for {} household IDs",
             count,
             hh_ids.len()
         );
