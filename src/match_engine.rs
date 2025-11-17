@@ -1,6 +1,7 @@
 use crate::database::Database;
 use crate::gpu::{GpuTileHandle, SimilarityComputer};
 use crate::matcher::{MatchResult, Matcher, ProgressCallback as MatcherProgressCallback};
+use crate::progress::logging_progress_callback;
 use crate::vectorizer::{Vectorizer, VECTOR_SIZE};
 use log::info;
 use std::collections::hash_map::DefaultHasher;
@@ -61,13 +62,42 @@ impl MatchEngine for CpuMatchEngine {
         min_similarity: f64,
         progress_callback: Option<MatchProgressCallback>,
     ) -> Result<usize, String> {
-        if let Some(callback) = progress_callback {
-            self.matcher.set_progress_handle(callback);
+        let total_ids = hh_ids.len();
+        let mut progress = progress_callback;
+
+        if total_ids > 0 && progress.is_none() {
+            progress = Some(logging_progress_callback("CPU matching", "IDs", total_ids));
+        }
+
+        if let Some(ref callback) = progress {
+            if let Ok(mut cb) = callback.lock() {
+                cb(0, total_ids);
+            }
+            self.matcher.set_progress_handle(callback.clone());
         } else {
             self.matcher.clear_progress_callback();
         }
 
-        self.matcher.match_and_store(hh_ids, db, min_similarity)
+        if total_ids == 0 {
+            info!("CPU matching completed immediately: no household IDs provided");
+            return Ok(0);
+        }
+
+        info!(
+            "CPU matching started: processing {} household IDs",
+            total_ids
+        );
+
+        let result = self.matcher.match_and_store(hh_ids, db, min_similarity);
+
+        if let Ok(matches) = result {
+            info!(
+                "CPU matching finished: stored {} matches for {} household IDs",
+                matches, total_ids
+            );
+        }
+
+        result
     }
 }
 
@@ -377,8 +407,32 @@ impl MatchEngine for GpuMatchEngine {
             return Err("No files found in database. Please scan a directory first.".to_string());
         }
 
-        if hh_ids.is_empty() {
+        let total_queries = hh_ids.len();
+        let mut progress = progress_callback;
+
+        if total_queries == 0 {
+            if let Some(callback) = progress.as_ref() {
+                if let Ok(mut cb) = callback.lock() {
+                    cb(0, 0);
+                }
+            } else {
+                info!("GPU matching completed immediately: no household IDs provided");
+            }
             return Ok(0);
+        }
+
+        if progress.is_none() {
+            progress = Some(logging_progress_callback(
+                "GPU matching",
+                "IDs",
+                total_queries,
+            ));
+        }
+
+        if let Some(ref callback) = progress {
+            if let Ok(mut cb) = callback.lock() {
+                cb(0, total_queries);
+            }
         }
 
         let file_pairs: Vec<(i64, String)> = files
@@ -403,9 +457,14 @@ impl MatchEngine for GpuMatchEngine {
         let (file_buffer, _) = self.ensure_gpu_buffer(&file_pairs)?;
 
         let mut all_matches = Vec::new();
-        let progress = progress_callback;
         let mut tracker = ProgressTracker::new(hh_ids.len(), total_files);
         let mut pending: VecDeque<PendingTile<'_>> = VecDeque::new();
+
+        info!(
+            "GPU matching started: processing {} household IDs across {} files",
+            total_queries,
+            file_pairs.len()
+        );
 
         for chunk in hh_ids.chunks(self.chunk_size.max(1)) {
             if chunk.is_empty() {
@@ -478,12 +537,12 @@ impl MatchEngine for GpuMatchEngine {
             .commit()
             .map_err(|e| format!("Failed to commit GPU matches: {}", e))?;
 
+        let total_matches = all_matches.len();
         info!(
-            "GPU match pass complete: {} matches persisted for {} household IDs",
-            all_matches.len(),
-            hh_ids.len()
+            "GPU matching finished: stored {} matches for {} household IDs",
+            total_matches, total_queries
         );
 
-        Ok(all_matches.len())
+        Ok(total_matches)
     }
 }
